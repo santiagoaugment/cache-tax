@@ -308,6 +308,8 @@ function armedText(s: State, now: number, windowMs: number): string {
 
 async function startWindow($: EngineInterface, s: State, windowMs: number, every: number) {
   const now = await $.clock.now()
+  // A /clear since session.start moved the process to a new conversation id.
+  s.sid = await $.session.id()
   s.every = every
   if (every === PING_AFTER_MS) await $.store.delete(everyKey(s))
   else await $.store.set(everyKey(s), every)
@@ -493,17 +495,21 @@ export const register: Register = on => {
     return r
   })
 
-  // Resume fields seed the guard before any turn of the resumed session has run.
-  on('classic.SessionStart', async ($, e, next) => {
-    const r = await next(e)
-    if (e.source === 'clear') {
+  // classic.SessionStart is withheld from user-tier plugins (cc-plugin-sec-default), so a
+  // /clear is seen here: the ending conversation's window goes, under its own id.
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') {
       await stop($, s, null)
       s.stopped = null
       resetForClear(s)
-      s.sid = await $.session.id()
       updateStatus($, s, await $.clock.now())
-      return r
     }
+    return next(e)
+  })
+
+  // Resume fields seed the guard before any turn of the resumed session has run.
+  on('classic.SessionStart', async ($, e, next) => {
+    const r = await next(e)
     const line = seedFromResume(s, e, await $.clock.now())
     // The resume payload may omit the model; without it the guard cannot price the cold write.
     if (!s.lastModel) s.lastModel = await $.session.model()

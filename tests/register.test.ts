@@ -34,7 +34,7 @@ type ForkAnswer = null | ModelForkResult | { read: number; write: number; out?: 
 
 // The world beneath the mod: its store, the engine's answers, and a fork that
 // replies from a script so each test decides what the cache looked like.
-function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string; model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string } = {}) {
+function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string | (() => string); model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string } = {}) {
   if (opts.store) {
     const store = opts.store
     on('store.get', ($, e) => ({ value: store.get(e.key) }))
@@ -54,7 +54,7 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
   const logs: string[] = []
   const entered: string[] = []
   on('session.start', ($, e) => ({ cwd: e.cwd }))
-  on('session.id', () => ({ value: opts.sid ?? 'S1' }))
+  on('session.id', () => ({ value: typeof opts.sid === 'function' ? opts.sid() : opts.sid ?? 'S1' }))
   on('session.model', () => ({ value: opts.model ?? 'claude-fable-5-1' }))
   on('session.usage', () => ({ value: { startedAt: START, context: { window: 1000000, tokens: opts.live?.tokens }, rateLimits: [] } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
@@ -63,6 +63,7 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
   on('prompt.submit', ($, e) => { entered.push(e.text); return { text: e.text } })
   on('session.compact', ($, e) => ({ messages: e.messages }))
   on('classic.SessionStart', () => ({}))
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('ui.log', ($, e) => { logs.push(e.text); return { value: undefined } })
   on('ui.status', ($, e) => { status.push(e.text); return { value: undefined } })
   on('ui.render', ($, e) => $.ui.resolve(e).Text({ children: [opts.bandText ?? ''] }))
@@ -213,10 +214,26 @@ describe('cache indicator', () => {
     expect(w.forks.length).toBe(0)
     await $.turn.complete(turn())
     expect((await ui.find({ type: 'Text', text: /^(warm|cold|unknown|stopped)$/ }))?.props.color).toBe('success')
-    await $.classic.SessionStart({ source: 'clear' })
+    // classic.SessionStart never reaches a user-tier plugin; /clear shows up as session.end.
+    await $.session.end({ reason: 'clear', sessionId: 'S1', resume: { id: 'S1' } })
     expect(await ui.find({ text: 'cache-tax' })).toBe(undefined)
     await clock.advance(HOUR)
     expect(w.forks.length).toBe(0)
+  })
+
+  test('a window set after /clear is kept under the new conversation', async ($, on) => {
+    mock.clock(on, { now: 10 * HOUR })
+    const store = new Map<string, unknown>()
+    let sid = 'S1'
+    world(on, [], { store, sid: () => sid })
+    await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
+    await $.command.run(run('keepwarm', '2h'))
+    expect(store.get('deadline:S1')).toBe(12 * HOUR)
+    await $.session.end({ reason: 'clear', sessionId: 'S1', resume: { id: 'S1' } })
+    sid = 'S2'
+    expect(store.has('deadline:S1')).toBe(false)
+    await $.command.run(run('keepwarm', '3h'))
+    expect(store.get('deadline:S2')).toBe(13 * HOUR)
   })
 
   test('window expiry removes the row and surveys retain their band', async ($, on) => {
