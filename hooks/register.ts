@@ -17,15 +17,26 @@ const KEY_PANE = 'pane'
 const PANE_TICK_MS = 60 * 1000
 const PING_HISTORY = 20
 
-// $ per million tokens, [cache read, 1h cache write, output], list prices September 2026.
-// Longer family names first: a model id matches the first row it contains.
+// $ per million tokens, [cache read, 1h cache write, output], list prices checked 2026-10-12
+// (platform.claude.com/docs/en/about-claude/pricing). Longer family names first: a model id
+// matches the first row it contains, so opus-5-5 must come before opus-5.
 const PRICES: Array<[string, number, number, number]> = [
   ['fable-5-1', 0.25, 20, 50],
+  ['mythos-5-1', 0.25, 20, 50],
   ['fable-5', 1, 20, 50],
+  ['mythos-5', 1, 20, 50],
+  ['opus-5-5', 0.2, 8, 20],
   ['opus-5', 0.5, 10, 25],
-  ['opus-4', 0.5, 10, 25],
+  ['opus-4-8', 0.5, 10, 25],
+  ['opus-4-7', 0.5, 10, 25],
+  ['opus-4-6', 0.5, 10, 25],
+  ['opus-4-5', 0.5, 10, 25],
+  ['opus-4', 1.5, 30, 75],
+  ['sonnet-5-5', 0.1, 4, 10],
   ['sonnet-5', 0.2, 4, 10],
   ['sonnet', 0.3, 6, 15],
+  // Haiku 5.5 bills more past a 100k-token prompt ($0.05 read, $1 write, $2.50 output); the short-prompt rate is kept here.
+  ['haiku-5-5', 0.01, 0.2, 0.5],
   ['haiku', 0.1, 2, 5],
 ]
 
@@ -56,7 +67,7 @@ export type State = {
   stopped: string | null
 }
 
-function priceOf(model: string | null): [number, number, number] | null {
+export function priceOf(model: string | null): [number, number, number] | null {
   const m = (model ?? '').toLowerCase().replace(/[\s.]+/g, '-')
   for (const [family, read, write, output] of PRICES) if (m.includes(family)) return [read, write, output]
   return null

@@ -2,7 +2,7 @@ import { describe, expect, mock, test, tier } from 'claude-code/testing'
 import type { CommandRunInput, ConfigSetInput, ModelForkResult, On, PromptSubmitInput, RenderPropsOf, SessionStartInput, TurnCompleteInput, TurnUsage } from 'claude-code'
 
 import { statusIcons } from '../hooks/status-icons'
-import { fmtDuration, freshState, parseDuration, resetForClear, seedFromResume } from '../hooks/register'
+import { fmtDuration, freshState, parseDuration, priceOf, resetForClear, seedFromResume } from '../hooks/register'
 
 tier('user')
 
@@ -989,5 +989,22 @@ describe('side pane', () => {
     await $.command.run(runFs('pane'))
     const ui = await mountPane($, 'desktop')
     expect((await ui.find({ type: 'Svg' }))?.props.source).toEqual(statusIcons.dark.warm.svg)
+  })
+})
+
+describe('prices', () => {
+  // [cache read, 1h cache write, output] per million, platform.claude.com/docs/en/about-claude/pricing, 2026-10-12.
+  test('a model id finds its own row, never a shorter family it contains', async () => {
+    expect(priceOf('claude-opus-5-5')).toEqual([0.2, 8, 20])
+    expect(priceOf('claude-opus-5')).toEqual([0.5, 10, 25])
+    expect(priceOf('claude-opus-4-8')).toEqual([0.5, 10, 25])
+    expect(priceOf('claude-opus-4-1-20250805')).toEqual([1.5, 30, 75])
+    expect(priceOf('claude-sonnet-5-5')).toEqual([0.1, 4, 10])
+    expect(priceOf('claude-sonnet-5')).toEqual([0.2, 4, 10])
+    expect(priceOf('claude-sonnet-4-6')).toEqual([0.3, 6, 15])
+    expect(priceOf('claude-haiku-5-5')).toEqual([0.01, 0.2, 0.5])
+    expect(priceOf('claude-haiku-4-5')).toEqual([0.1, 2, 5])
+    expect(priceOf('claude-fable-5-1')).toEqual([0.25, 20, 50])
+    expect(priceOf('claude-fable-5')).toEqual([1, 20, 50])
   })
 })
