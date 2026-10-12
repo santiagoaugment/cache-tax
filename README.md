@@ -82,6 +82,12 @@ The cube follows Claude's light or dark theme. Its terminal image also has a con
 
 The mod reads the theme and `NO_COLOR` once when the session starts. Accepted theme changes update the icon immediately; ordinary redraws do not reread either setting. Set `NO_COLOR` before starting the session.
 
+### The sidebar pane (this fork)
+
+`/cache-tax pane` docks a pane beside the transcript, the way a file tree does: the cube and state, the one-hour TTL as a draining bar, context size with the warm-read and cold-write prices, the keepwarm window with its own bar and next ping, the last pings with their reads and cost, and this session's cold writes and guard mode. Buttons arm `90m` or `6h`, turn keepwarm `off` and flip the guard (hotkeys `1`, `6`, `o`, `g` while the pane has focus). It redraws once a minute while open.
+
+It is a sidebar or nothing: on the terminal it needs the fullscreen layout (`/tui fullscreen`), and a pane the engine seats inline above the prompt closes itself. Once opened it reopens at every session start; its close mark or `/cache-tax pane off` forgets that. While it is open the band above the prompt keeps only the cube and state.
+
 ## Both forms installed
 
 The hook and the mod share a name and a job, so having both means two guards on every cold send. The mod checks at session start whether the hook's `/cache-tax:status` command exists and says so once. Keep one guard. The hook remains an option for people who prefer settings hooks. Before uninstalling it, check your status line: the 🧊 row wired to `cache-tax.js` comes from the hook's files. This mod draws above the prompt while keepwarm is armed; it does not replace your shell status line.

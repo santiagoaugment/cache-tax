@@ -1,5 +1,6 @@
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, RenderInput, RenderNode } from 'claude-code'
 import { statusIcons } from './status-icons'
+import { PANE, drawPane, type CacheState, type PaneModel } from './pane'
 
 const TTL_MS = 60 * 60 * 1000
 const PING_AFTER_MS = 50 * 60 * 1000
@@ -12,6 +13,9 @@ const KEY_DEADLINE = 'deadline'
 const KEY_EVERY = 'every'
 const KEY_GUARD = 'guard'
 const KEY_ALWAYS = 'always'
+const KEY_PANE = 'pane'
+const PANE_TICK_MS = 60 * 1000
+const PING_HISTORY = 20
 
 // $ per million tokens, [cache read, 1h cache write, output], list prices September 2026.
 // Longer family names first: a model id matches the first row it contains.
@@ -31,6 +35,10 @@ type GuardMode = 'refuse' | 'warn'
 
 export type State = {
   hasBand: boolean
+  surface: string | null
+  paneOpen: boolean
+  windowMs: number
+  pings: PingRecord[]
   sid: string
   deadline: number
   every: number
@@ -128,6 +136,7 @@ export function resetForClear(s: State) {
   s.ackedAt = 0
   s.coldWritePending = false
   s.misses = []
+  s.pings = []
   disarm(s)
 }
 
@@ -147,16 +156,57 @@ function statusText(s: State, now: number): string | undefined {
   if (s.stopped) return `keepwarm stopped: ${s.stopped}`
   if (!s.deadline) return undefined
   const pingText = s.last ? ` · last ping read ${fmtTok(s.last.read)} ${fmtUsd(s.last.usd)}` : ''
-  const nextText = !s.lastRequestAt ? ' · waiting for the first turn'
-    : s.compacted ? ' · waiting for the first turn after compaction'
-    : isCold(s, now) ? ` · cold now, first ping ${fmtDuration(s.every)} after the next turn`
-    : ` · ping in ${fmtDuration(s.lastRequestAt + s.every - now)}`
-  return `keepwarm ${fmtDuration(s.deadline - now)} left${nextText}${pingText}`
+  return `keepwarm ${fmtDuration(s.deadline - now)} left · ${nextPingText(s, now)}${pingText}`
+}
+
+function nextPingText(s: State, now: number): string {
+  return !s.lastRequestAt ? 'waiting for the first turn'
+    : s.compacted ? 'waiting for the first turn after compaction'
+    : isCold(s, now) ? `cold now, first ping ${fmtDuration(s.every)} after the next turn`
+    : `ping in ${fmtDuration(s.lastRequestAt + s.every - now)}`
+}
+
+function cacheState(s: State, now: number): CacheState {
+  return s.stopped ? 'stopped' : !s.lastRequestAt || s.compacted ? 'unknown' : isCold(s, now) ? 'cold' : 'warm'
+}
+
+export function paneModel(s: State, now: number): PaneModel {
+  const cold = isCold(s, now)
+  const state: CacheState = !s.lastRequestAt || s.compacted ? 'unknown' : cold ? 'cold' : 'warm'
+  const headline = s.compacted ? 'reset by compaction, waiting for the first turn'
+    : !s.lastRequestAt ? 'no request yet this session'
+    : cold ? `cold for ${fmtDuration(now - s.lastRequestAt - TTL_MS)}, the next send re-writes it`
+    : `expires in ${fmtDuration(s.lastRequestAt + TTL_MS - now)}`
+  const price = priceOf(s.lastModel)
+  const pingUsds = s.pings.map(p => p.usd)
+  return {
+    state,
+    headline,
+    ttlLeft: state === 'unknown' ? null : cold ? 0 : (s.lastRequestAt + TTL_MS - now) / TTL_MS,
+    model: s.lastModel ?? 'not seen yet',
+    context: `${s.ctx.toLocaleString('en-US')} tok`,
+    warmTurn: fmtUsd(warmUsd(s)),
+    coldWrite: fmtUsd(coldUsd(s)),
+    ratio: price && s.ctx > 0 ? `a cold write costs ${Math.round(price[1] / price[0])}x a warm read` : null,
+    keepwarm: s.deadline && now < s.deadline
+      ? { left: fmtDuration(s.deadline - now), next: nextPingText(s, now), share: s.windowMs > 0 ? (s.deadline - now) / s.windowMs : 1, always: s.always }
+      : null,
+    stopped: s.stopped,
+    pings: s.pings.map(p => ({ ago: `${fmtDuration(now - p.at)} ago`, read: fmtTok(p.read), write: fmtTok(p.write), usd: fmtUsd(p.usd), warm: p.warm })),
+    pingTotal: pingUsds.some(u => u === null) ? 'n/a' : fmtUsd(pingUsds.reduce<number>((a, u) => a + (u ?? 0), 0)),
+    coldWrites: `${s.misses.length} · ${fmtUsd(s.misses.reduce((a, m) => a + (m.usd ?? 0), 0))}`,
+    guard: s.guard,
+  }
 }
 
 function updateStatus($: EngineInterface, s: State, now: number) {
   if (s.hasBand) $.ui.invalidate('ui.render')
   else $.ui.status(statusText(s, now))
+}
+
+/** The band redraws through updateStatus; the pane also shows what changes with keepwarm off. */
+function redrawPane($: EngineInterface, s: State) {
+  if (s.paneOpen) $.ui.invalidate('ui.render')
 }
 
 function disarm(s: State) {
@@ -244,6 +294,7 @@ async function ping($: EngineInterface, s: State) {
   const warm = u.cache_read_input_tokens > 0 && u.cache_creation_input_tokens < 0.1 * u.cache_read_input_tokens
   const usd = price ? pingUsd(u, price) : null
   s.last = { at: now, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens, usd, warm }
+  s.pings = [...s.pings, s.last].slice(-PING_HISTORY)
   if (!warm) return stop($, s, `the ping read ${fmtTok(u.cache_read_input_tokens)} and wrote ${fmtTok(u.cache_creation_input_tokens)} tokens (${fmtUsd(usd)}), the cache was already gone`)
   s.lastRequestAt = now
   await arm($, s)
@@ -261,6 +312,7 @@ async function startWindow($: EngineInterface, s: State, windowMs: number, every
   if (every === PING_AFTER_MS) await $.store.delete(everyKey(s))
   else await $.store.set(everyKey(s), every)
   s.deadline = now + windowMs
+  s.windowMs = windowMs
   s.stopped = null
   await $.store.set(deadlineKey(s), s.deadline)
   await arm($, s)
@@ -286,9 +338,30 @@ function card(s: State, now: number): string {
   return lines.join('\n')
 }
 
+type Look = { light: boolean; noColor: boolean }
+
+function stateColor(state: CacheState, look: Look): string | undefined {
+  return look.noColor ? undefined : state === 'warm' ? 'success' : state === 'cold' ? (look.light ? '#c15f3c' : '#d97757') : undefined
+}
+
+function cube($: EngineInterface, e: RenderInput<'AbovePrompt' | 'Pane'>, state: CacheState, look: Look): RenderNode {
+  const { Text } = $.ui.resolve(e)
+  const asset = statusIcons[look.light ? 'light' : 'dark'][state === 'warm' || state === 'cold' ? state : 'neutral']
+  return look.noColor ? Text({ bold: true, children: ['[>]'] })
+    : e.surface === 'terminal' ? $.ui.resolve(e).Image({ source: { png: asset.png }, columns: 3, rows: 1, alt: '[>]' })
+    : e.surface === 'desktop' ? $.ui.resolve(e).Svg({ source: asset.svg, width: 18, height: 18, alt: 'Cache Tax' })
+    : Text({ color: stateColor(state, look), bold: true, children: ['[>]'] })
+}
+
+async function openPane($: EngineInterface, s: State) {
+  s.paneOpen = true
+  await $.ui.open({ id: PANE, title: 'Cache Tax' })
+  $.ui.invalidate('ui.render')
+}
+
 export function freshState(): State {
   return {
-    hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
+    hasBand: false, surface: null, paneOpen: false, windowMs: 0, pings: [], sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
   }
 }
@@ -313,29 +386,68 @@ export const register: Register = on => {
     const now = await $.clock.now()
     const text = statusText(s, now)
     if (!text || (s.deadline && now >= s.deadline)) return rest
-    const state = s.stopped ? 'stopped' : !s.lastRequestAt || s.compacted ? 'unknown' : isCold(s, now) ? 'cold' : 'warm'
-    const color = noColor ? undefined : state === 'warm' ? 'success' : state === 'cold' ? (light ? '#c15f3c' : '#d97757') : undefined
+    const state = cacheState(s, now)
+    const look = { light, noColor }
+    const color = stateColor(state, look)
     const { Box, Text } = $.ui.resolve(e)
-    const asset = statusIcons[light ? 'light' : 'dark'][state === 'warm' || state === 'cold' ? state : 'neutral']
-    const icon = noColor ? Text({ bold: true, children: ['[>]'] })
-      : e.surface === 'terminal' ? $.ui.resolve(e).Image({ source: { png: asset.png }, columns: 3, rows: 1, alt: '[>]' })
-      : e.surface === 'desktop' ? $.ui.resolve(e).Svg({ source: asset.svg, width: 18, height: 18, alt: 'Cache Tax' })
-      : Text({ color, bold: true, children: ['[>]'] })
     return Box({ flexDirection: 'column', children: [
       rest,
       Box({ flexDirection: 'row', alignItems: 'center', children: [
-        Box({ flexShrink: 0, children: [icon] }),
+        Box({ flexShrink: 0, children: [cube($, e, state, look)] }),
         Text({ children: [
           ' cache-tax · ',
           Text({ color, bold: true, children: [state] }),
-          ` · ${text}`,
+          // The pane carries the details; the band keeps only the cube and its state.
+          s.paneOpen ? '' : ` · ${text}`,
         ] }),
       ] }),
     ] })
   })
 
+  // The pane's countdowns move with the clock, not with events, so it redraws once a minute while open.
+  let tick: { cancel: () => void } | null = null
+  const stopTick = () => {
+    tick?.cancel()
+    tick = null
+  }
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    // A sidebar or nothing: on the terminal's main screen the pane would sit above the prompt, where the band already is.
+    if (e.surface === 'terminal' && e.props.placement === 'inline') {
+      void $.ui.close({ id: PANE })
+      return Box({ children: [] })
+    }
+    s.paneOpen = true
+    tick ??= $.clock.every(PANE_TICK_MS, () => $.ui.invalidate('ui.render'))
+    const now = await $.clock.now()
+    const m = paneModel(s, now)
+    const look = { light, noColor }
+    return drawPane($.ui.resolve(e), e.props.bodyColumns, m, { icon: cube($, e, m.state, look), color: stateColor(m.state, look) }, {
+      warm: windowMs => startWindow($, s, windowMs, PING_AFTER_MS),
+      off: () => stop($, s, null, true),
+      toggleGuard: async () => {
+        s.guard = s.guard === 'refuse' ? 'warn' : 'refuse'
+        await $.store.set(KEY_GUARD, s.guard)
+        $.ui.invalidate('ui.render')
+      },
+    })
+  })
+
+  on('ui.close', async ($, e, next) => {
+    const r = await next(e)
+    if (e.id !== PANE) return r
+    s.paneOpen = false
+    stopTick()
+    // Closed by its own mark: the person no longer wants it at session start either.
+    if (e.origin.kind === 'person') await $.store.delete(KEY_PANE)
+    $.ui.invalidate('ui.render')
+    return r
+  })
+
   on('session.start', async ($, e, next) => {
     const r = await next(e)
+    s.surface = e.surface
     s.hasBand = e.surface === 'terminal' || e.surface === 'desktop'
     if (s.hasBand) {
       const theme = (await $.config.list()).find(row => row.key === 'theme')?.value
@@ -350,6 +462,7 @@ export const register: Register = on => {
     const savedEvery = await $.store.get(everyKey(s))
     const savedGuard = await $.store.get(KEY_GUARD)
     s.deadline = typeof saved === 'number' && saved > now ? saved : 0
+    s.windowMs = s.deadline ? s.deadline - now : 0
     s.every = typeof savedEvery === 'number' && savedEvery >= MIN_PING_MS ? savedEvery : PING_AFTER_MS
     s.guard = savedGuard === 'warn' ? 'warn' : 'refuse'
     s.always = (await $.store.get(KEY_ALWAYS)) === true
@@ -365,8 +478,8 @@ export const register: Register = on => {
     })
     await $.command.register({
       name: 'cache-tax',
-      description: 'Prompt cache state, cold price and this session\'s cold writes; guard warn|refuse (cache-tax, the Mod)',
-      argumentHint: '[status | guard warn | guard refuse]',
+      description: 'Prompt cache state, cold price and this session\'s cold writes; pane opens the sidebar; guard warn|refuse (cache-tax, the Mod)',
+      argumentHint: '[status | pane | pane off | guard warn | guard refuse]',
       immediate: true,
     })
     // The hook form of cache-tax ships a /cache-tax:status skill; both installed means two guards.
@@ -374,6 +487,8 @@ export const register: Register = on => {
     if (commands.some(c => c.name === 'cache-tax:status')) {
       $.ui.log('the hook form (cache-tax@claude-code-hooks) is also installed, so a cold send is warned about or refused twice. Uninstall it, or /cache-tax guard warn here.')
     }
+    // Unasked, the engine seats it only where the terminal is wide enough; narrower, it waits undrawn.
+    if (s.hasBand && (await $.store.get(KEY_PANE)) === true) void openPane($, s)
     updateStatus($, s, now)
     return r
   })
@@ -440,7 +555,21 @@ export const register: Register = on => {
       if (words[1] !== 'warn' && words[1] !== 'refuse') return { text: '/cache-tax guard takes warn or refuse' }
       s.guard = words[1]
       await $.store.set(KEY_GUARD, s.guard)
+      redrawPane($, s)
       return { text: s.guard === 'refuse' ? 'guard set to refuse once: a cold send is dropped with its price, the resend goes through' : 'guard set to warn: a cold send goes through with its price shown' }
+    }
+    if (words[0] === 'pane') {
+      if (words[1] === 'off') {
+        await $.store.delete(KEY_PANE)
+        await $.ui.close({ id: PANE })
+        return { text: 'cache-tax pane closed, and no longer opens at session start' }
+      }
+      if (s.surface === 'terminal' && !e.presentation?.isFullscreen) {
+        return { text: 'the cache-tax pane docks beside the transcript in the fullscreen layout: run /tui fullscreen, then /cache-tax pane' }
+      }
+      await $.store.set(KEY_PANE, true)
+      await openPane($, s)
+      return { text: 'cache-tax pane open, and it reopens at session start; /cache-tax pane off to close it for good' }
     }
     return { text: card(s, now) }
   })
@@ -503,6 +632,7 @@ export const register: Register = on => {
     }
     s.coldWritePending = false
     await arm($, s)
+    redrawPane($, s)
     return r
   })
 
@@ -514,6 +644,7 @@ export const register: Register = on => {
       s.ackedAt = 0
       disarm(s)
       await arm($, s)
+      redrawPane($, s)
     }
     return r
   })

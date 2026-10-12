@@ -66,6 +66,10 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
   on('ui.log', ($, e) => { logs.push(e.text); return { value: undefined } })
   on('ui.status', ($, e) => { status.push(e.text); return { value: undefined } })
   on('ui.render', ($, e) => $.ui.resolve(e).Text({ children: [opts.bandText ?? ''] }))
+  const panes = new Set<string>()
+  on('ui.open', ($, e) => { panes.add(e.id); return { value: { isPlaced: true as const } } })
+  on('ui.close', ($, e) => { panes.delete(e.id); return { value: undefined } })
+  on('ui.panes', () => ({ value: [...panes].map(id => ({ id, title: 'Cache Tax', isShown: true, isFocused: false, isPlaced: true })) }))
   on('model.fork', () => {
     forks.push(forks.length)
     const a = forkAnswers.shift()
@@ -75,7 +79,7 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
     const value: ModelForkResult = { isAnswered: true, text: 'warm', usage: { input_tokens: a.input ?? 2, output_tokens: a.out ?? 1, cache_read_input_tokens: a.read, cache_creation_input_tokens: a.write } }
     return { value }
   })
-  return { forks, status, logs, entered, reads }
+  return { forks, status, logs, entered, reads, panes }
 }
 
 const warm: ForkAnswer = { read: 200000, write: 0 }
@@ -824,5 +828,149 @@ describe('store per session', () => {
     world(on, [], { store, sid: 'mine' })
     await $.session.start(session)
     expect([...store.keys()]).toEqual(['deadline:other', 'every:other'])
+  })
+})
+
+const runFs = (args: string): CommandRunInput => ({ ...run('cache-tax', args), presentation: { isFullscreen: true, columns: 200 } })
+
+const paneProps: RenderPropsOf['Pane'] = {
+  title: 'Cache Tax', isFocused: false, bodyColumns: 36, placement: 'dock',
+  scroll: { offset: 0, bodyRows: 40 }, view: {},
+}
+
+const mountPane = ($: Parameters<Parameters<typeof test>[1]>[0], surface: 'terminal' | 'desktop' = 'terminal') =>
+  $.ui.mount({ plugin: 'cache-tax', surface, component: 'Pane', requestId: 'cache-tax', props: paneProps })
+
+const texts = async (ui: { findAll: (q: { type: 'Text' }) => Promise<Array<{ text: string }>> }) =>
+  (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\n')
+
+describe('side pane', () => {
+  test('/cache-tax pane opens it and remembers; /cache-tax pane off closes and forgets', async ($, on) => {
+    mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    const w = world(on, [], { store })
+    await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
+    expect(w.panes.has('cache-tax')).toBe(false)
+    const opened = await $.command.run(runFs('pane'))
+    expect(opened.text).toMatch(/pane/)
+    expect(w.panes.has('cache-tax')).toBe(true)
+    expect(store.get('pane')).toBe(true)
+    await $.command.run(runFs('pane off'))
+    expect(w.panes.has('cache-tax')).toBe(false)
+    expect(store.has('pane')).toBe(false)
+  })
+
+  test('a remembered pane reopens at session start', async ($, on) => {
+    mock.clock(on, { now: START })
+    const w = world(on, [], { store: new Map<string, unknown>([['pane', true]]) })
+    await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
+    expect(w.panes.has('cache-tax')).toBe(true)
+  })
+
+  test('a terminal outside fullscreen gets the hint, not an inline pane', async ($, on) => {
+    mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    const w = world(on, [], { store })
+    await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
+    const r = await $.command.run(run('cache-tax', 'pane'))
+    expect(r.text).toMatch(/\/tui fullscreen/)
+    expect(w.panes.has('cache-tax')).toBe(false)
+    expect(store.has('pane')).toBe(false)
+  })
+
+  test('a pane seated inline closes itself and stays remembered for the sidebar', async ($, on) => {
+    mock.clock(on, { now: START })
+    const store = new Map<string, unknown>([['pane', true]])
+    const w = world(on, [], { store })
+    await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
+    expect(w.panes.has('cache-tax')).toBe(true)
+    await $.ui.mount({ plugin: 'cache-tax', surface: 'terminal', component: 'Pane', requestId: 'cache-tax', props: { ...paneProps, placement: 'inline' } })
+    expect(w.panes.has('cache-tax')).toBe(false)
+    expect(store.get('pane')).toBe(true)
+  })
+
+  test('shows state, TTL countdown, context and both prices', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    world(on, [], { live: { tokens: 200000 } })
+    await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
+    await $.command.run(runFs('pane'))
+    const ui = await mountPane($)
+    expect(await texts(ui)).toMatch(/no request yet/i)
+    await $.turn.complete(turn())
+    let t = await texts(ui)
+    expect(t).toMatch(/^warm$/m)
+    expect(t).toMatch(/1h00m|60m/)
+    expect(t).toMatch(/200,000/)
+    expect(t).toMatch(/\$4\.00/)
+    expect(t).toMatch(/\$0\.05/)
+    expect(t).toMatch(/claude-fable-5-1/)
+    // The countdown moves with no other event: the pane ticks while open.
+    await clock.advance(5 * MIN)
+    expect(await texts(ui)).toMatch(/55m/)
+    await clock.advance(HOUR)
+    t = await texts(ui)
+    expect(t).toMatch(/^cold$/m)
+    expect((await ui.find({ type: 'Text', text: /^cold$/ }))?.props.color).toBe('#d97757')
+  })
+
+  test('keeps a ping history with the total spent', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    world(on, [warm, warm], { live: { tokens: 200000 } })
+    await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await $.command.run(runFs('pane'))
+    const ui = await mountPane($)
+    expect(await texts(ui)).toMatch(/no pings yet/i)
+    await clock.advance(50 * MIN)
+    await clock.advance(50 * MIN)
+    const t = await texts(ui)
+    expect(t).toMatch(/2 pings/)
+    expect(t).toMatch(/read 200k/)
+    expect(t).toMatch(/\$0\.10/)
+    expect(t).toMatch(/keepwarm/i)
+    expect(t).toMatch(/left/)
+  })
+
+  test('buttons arm, shorten and stop keepwarm and flip the guard', async ($, on) => {
+    mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    world(on, [], { store, sid: 'S1' })
+    await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
+    await $.turn.complete(turn())
+    await $.command.run(runFs('pane'))
+    const ui = await mountPane($)
+    await ui.press({ key: 'warm-90m' })
+    expect(store.get('deadline:S1')).toBe(START + 90 * MIN)
+    await ui.press({ key: 'warm-6h' })
+    expect(store.get('deadline:S1')).toBe(START + 6 * HOUR)
+    await ui.press({ key: 'warm-off' })
+    expect(store.has('deadline:S1')).toBe(false)
+    await ui.press({ key: 'guard' })
+    expect(store.get('guard')).toBe('warn')
+    expect(await texts(ui)).toMatch(/warn/)
+  })
+
+  test('while the pane is open the band keeps only the cube and state', async ($, on) => {
+    mock.clock(on, { now: START })
+    world(on, [])
+    await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '90m'))
+    const band = await $.ui.mount({ plugin: 'cache-tax', surface: 'terminal', component: 'AbovePrompt', props: bandProps })
+    expect(await band.find({ type: 'Text', text: /keepwarm/ })).not.toBe(undefined)
+    await $.command.run(runFs('pane'))
+    expect(await band.find({ type: 'Text', text: /keepwarm/ })).toBe(undefined)
+    expect(await band.find({ type: 'Text', text: /^warm$/ })).not.toBe(undefined)
+  })
+
+  test('desktop draws the cube as an Svg', async ($, on) => {
+    mock.clock(on, { now: START })
+    world(on, [])
+    await $.session.start({ ...session, surface: 'desktop', isInteractive: true })
+    await $.turn.complete(turn())
+    await $.command.run(runFs('pane'))
+    const ui = await mountPane($, 'desktop')
+    expect((await ui.find({ type: 'Svg' }))?.props.source).toEqual(statusIcons.dark.warm.svg)
   })
 })

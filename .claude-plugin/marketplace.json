@@ -1,0 +1,12 @@
+{
+  "name": "santi-cache-tax",
+  "owner": {
+    "name": "Santiago"
+  },
+  "plugins": [
+    {
+      "name": "cache-tax",
+      "source": "./"
+    }
+  ]
+}
