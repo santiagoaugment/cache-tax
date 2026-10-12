@@ -5,6 +5,13 @@
 
 # Cache Tax for Claude Code
 
+> **Fork.** This is a fork of [karanb192/cache-tax](https://github.com/karanb192/cache-tax) by Karan Bansal, who wrote the mod. This fork adds a docked [sidebar pane](#the-sidebar-pane-this-fork) (`/cache-tax pane`). Install it with:
+>
+> ```sh
+> claude plugin marketplace add santiagoaugment/cache-tax
+> claude plugin install cache-tax@santi-cache-tax
+> ```
+
 **Keep Claude Code's prompt cache warm during breaks.**
 
 Cache Tax is a Claude Code mod that refreshes your prompt cache while you step away and shows the estimated rewrite cost before a cold send. Run `/keepwarm 90m` before a break. Pings cost tokens; choose a window you expect to return within.
